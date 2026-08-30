@@ -7,7 +7,7 @@
 ;; Maintainer: Chris Hodapp <chris@hodapp.email>
 ;; URL: https://github.com/clhodapp/parenting
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "26.1"))
 ;; Keywords: processes, tools
 ;; SPDX-License-Identifier: MIT
 

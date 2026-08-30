@@ -17,7 +17,7 @@ Emacs binary and drive it), remote-controlling a sandboxed Emacs
 process, and managing children on other machines — ssh hosts, VMs,
 TRAMP-style specs (`parenting-spawn-remote`).
 
-Requires Emacs 29.1 or later. No other dependencies; remote children
+Requires Emacs 26.1 or later. No other dependencies; remote children
 additionally need OpenSSH on both ends (see below).
 
 ## Installing
