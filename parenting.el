@@ -205,7 +205,7 @@ message announcing ROLE to the other side."
   (let ((conn (parenting--make-connection
                :process process
                :role role
-               :buffer (generate-new-buffer " *parenting*" t))))
+               :buffer (generate-new-buffer " *parenting*"))))
     (process-put process 'parenting-connection conn)
     (set-process-filter process #'parenting--filter)
     (set-process-sentinel process #'parenting--sentinel)
