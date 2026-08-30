@@ -258,7 +258,7 @@ parenting .el sources, when the parent's copy is not visible to it."
                   :service socket
                   :noquery t
                   :log #'parenting--server-log))
-         (stderr (generate-new-buffer (format " *%s-stderr*" name) t))
+         (stderr (generate-new-buffer (format " *%s-stderr*" name)))
          (library-directory (or child-library-directory
                                 (parenting--child-library-directory)))
          (child-command (append

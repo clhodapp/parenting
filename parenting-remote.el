@@ -40,6 +40,9 @@
 (require 'parenting-parent)
 (require 'cl-lib)
 (eval-when-compile (require 'tramp))
+;; Required at runtime right before use; the byte compiler of Emacs 28
+;; and older cannot see that and warns without this declaration.
+(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
 
 (defconst parenting-remote--ssh-methods '("ssh" "sshx" "scp" "scpx")
   "TRAMP methods that a plain ssh client can reach directly.")
