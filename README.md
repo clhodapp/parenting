@@ -17,7 +17,7 @@ Emacs binary and drive it), remote-controlling a sandboxed Emacs
 process, and managing children on other machines — ssh hosts, VMs,
 TRAMP-style specs (`parenting-spawn-remote`).
 
-Requires Emacs 29.1 or later. No other dependencies; remote children
+Requires Emacs 26.1 or later. No other dependencies; remote children
 additionally need OpenSSH on both ends (see below).
 
 ## Installing
@@ -25,9 +25,15 @@ additionally need OpenSSH on both ends (see below).
 Four files: `parenting.el` (the protocol), `parenting-parent.el`,
 `parenting-child.el`, and `parenting-remote.el`. Not on MELPA yet. The
 version is pre-1.0: the API described here is stable in intent, but
-names and signatures may still change before 1.0.
+names and signatures may still change before 1.0. Pick the route for
+your Emacs; every route keeps the `.el` sources next to whatever gets
+loaded, which the child bootstrap requires (it loads them by exact
+file name).
 
-On Emacs 30 or later, `use-package` fetches and installs it:
+### Emacs 30 and later
+
+`use-package` fetches and installs it with the `:vc` keyword;
+`package-vc-upgrade` pulls later commits:
 
 ```elisp
 (use-package parenting
@@ -36,25 +42,44 @@ On Emacs 30 or later, `use-package` fetches and installs it:
              parenting-child-connect parenting-child-start))
 ```
 
-On Emacs 29, `package-vc-install` does the same fetch as a one-off
-(`package-vc-upgrade` pulls later commits), and the `use-package` block
-above works without its `:vc` line:
+### Emacs 29
+
+`package-vc-install` does the same fetch as a one-off
+(`package-vc-upgrade` pulls later commits), and the `use-package`
+block above then works without its `:vc` line:
 
 ```elisp
 (package-vc-install "https://github.com/clhodapp/parenting")
 ```
 
-With straight.el (elpaca accepts the same recipe form):
+### Emacs 26 through 28
+
+Clone the repository, then install from the directory with
+`package-install-file`; package.el copies the sources into
+`package-user-dir`, byte-compiles them, and generates the autoloads:
+
+```
+git clone https://github.com/clhodapp/parenting ~/src/parenting
+```
+
+```
+M-x package-install-file RET ~/src/parenting RET
+```
+
+To upgrade, `git pull` in the clone and run `package-install-file`
+again.
+
+If you use straight.el, a recipe does the clone, build, and upgrades
+for you (elpaca accepts the same recipe form):
 
 ```elisp
 (straight-use-package
  '(parenting :type git :host github :repo "clhodapp/parenting"))
 ```
 
-Or clone it, add the directory to `load-path`, and `require` the side
-you need (`parenting-parent`, `parenting-child`, `parenting-remote`).
-The child bootstrap needs the `.el` sources next to whatever is loaded
-(it loads them by exact file name), which every route above provides.
+Or skip installation altogether: clone, add the directory to
+`load-path`, and `require` the side you need (`parenting-parent`,
+`parenting-child`, `parenting-remote`).
 
 ## Parent side (`parenting-parent`)
 

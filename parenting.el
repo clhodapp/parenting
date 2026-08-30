@@ -7,7 +7,7 @@
 ;; Maintainer: Chris Hodapp <chris@hodapp.email>
 ;; URL: https://github.com/clhodapp/parenting
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "26.1"))
 ;; Keywords: processes, tools
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -216,7 +216,7 @@ message announcing ROLE to the other side."
   (let ((conn (parenting--make-connection
                :process process
                :role role
-               :buffer (generate-new-buffer " *parenting*" t))))
+               :buffer (generate-new-buffer " *parenting*"))))
     (process-put process 'parenting-connection conn)
     (set-process-filter process #'parenting--filter)
     (set-process-sentinel process #'parenting--sentinel)
