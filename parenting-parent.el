@@ -349,10 +349,13 @@ connection closes; with DAEMON non-nil it runs with --fg-daemon
 instead — a full interactive Emacs with no visible frame, which you
 can promote later by evaluating a `make-frame' form in it; with both
 nil the child starts normally and shows a frame on the parent's
-display.  With QUICK nil, -Q is dropped so the child starts with its
-normal init files.  NAME names the child process.  Signal
-`parenting-timeout' if the child has not connected after TIMEOUT
-seconds.
+display.  A daemon child gets its own Emacs server name, so it does
+not collide with any daemon already running under the default name
+\(a daemon refuses to start when its server name is taken); DAEMON
+may also be a string naming that server explicitly.  With QUICK
+nil, -Q is dropped so the child starts with its normal init files.
+NAME names the child process.  Signal `parenting-timeout' if the
+child has not connected after TIMEOUT seconds.
 
 The remaining keywords exist for launching the child inside a
 sandbox or on another machine.  COMMAND-WRAPPER is either a list of
@@ -421,7 +424,12 @@ host network.  See `parenting--sandbox-command-wrapper'."
                          (list emacs)
                          (and quick '("-Q"))
                          (and batch '("--batch"))
-                         (and daemon '("--fg-daemon"))
+                         (and daemon
+                              (list (concat "--fg-daemon="
+                                            (if (stringp daemon)
+                                                daemon
+                                              (make-temp-name
+                                               (concat name "-"))))))
                          args
                          (cl-mapcan (lambda (dir) (list "-L" dir))
                                     extra-load-path)

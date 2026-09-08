@@ -431,6 +431,30 @@
           (should (> (parenting-eval conn '(length (frame-list))) 0)))
       (parenting-shutdown conn))))
 
+(ert-deftest parenting-spawn-daemon-children-do-not-collide ()
+  ;; Each daemon child names its own Emacs server: an Emacs daemon
+  ;; refuses to start when its server name is already taken, so two
+  ;; children under the default name (or one beside the user's own
+  ;; daemon) could not coexist.
+  (let ((a (parenting-spawn :daemon t :timeout 60)))
+    (unwind-protect
+        (let ((b (parenting-spawn :daemon t :timeout 60)))
+          (unwind-protect
+              (progn
+                (should (eq t (parenting-eval b '(and (daemonp) t))))
+                (should-not (equal "server" (parenting-eval a 'server-name)))
+                (should-not (equal (parenting-eval a 'server-name)
+                                   (parenting-eval b 'server-name))))
+            (parenting-shutdown b)))
+      (parenting-shutdown a))))
+
+(ert-deftest parenting-spawn-daemon-name-is-honored ()
+  (let ((conn (parenting-spawn :daemon "parenting-test-named" :timeout 60)))
+    (unwind-protect
+        (should (equal "parenting-test-named"
+                       (parenting-eval conn 'server-name)))
+      (parenting-shutdown conn))))
+
 (ert-deftest parenting-spawn-rejects-batch-plus-daemon ()
   (should-error (parenting-spawn :batch t :daemon t)))
 

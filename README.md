@@ -113,7 +113,10 @@ one), `:batch`/`:daemon` (see below), `:quick` (default t; nil drops
   Emacs (event loop, timers, frame machinery, real init with
   `:quick nil`) with no visible frame. Right for driving a new build
   off-screen. Promote it to visible later by evaluating a
-  `make-frame` form in it.
+  `make-frame` form in it. The child's Emacs server gets a private
+  name (an Emacs daemon refuses to start while another server holds
+  its name, so this keeps it clear of a daemon you already run);
+  pass a string instead of t to choose the name.
 - both nil — the child starts normally and opens a frame on the
   parent's display: trying the new build as a user, or watching a
   sandboxed agent's Emacs.
