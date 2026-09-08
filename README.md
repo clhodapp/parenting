@@ -131,7 +131,55 @@ Testing a fresh nix build is just:
 ```
 
 For children that must run inside a sandbox (e.g. an Emacs-hosted
-LLM agent under bwrap), three more keywords wrap the command:
+LLM agent), `:sandbox` builds a [bubblewrap](https://github.com/containers/bubblewrap)
+jail for you:
+
+```elisp
+(parenting-spawn
+ :sandbox '(:ro-binds ("/home/me/project")   ; dirs the child may read
+            :rw-binds ("/home/me/project/build")
+            :environment ("SSL_CERT_FILE")   ; names carried in
+            :network nil))                   ; no network (the default)
+```
+
+`:sandbox` is a plist and, when given, derives `:command-wrapper`,
+`:child-socket-path` and `:child-library-directory` itself, so those
+three are mutually exclusive with it (passing any alongside `:sandbox`
+is an error). Everything else — `:emacs`, `:args`, `:load-path`,
+`:init`, `:batch`/`:daemon`, `:quick`, `:name`, `:timeout` — still
+applies. The jail always runs with `--die-with-parent`, a minimal
+read-only root built from the system directories the Emacs binary
+needs (`/usr`, `/bin`, … whichever exist) plus a whole-store
+read-only bind of `/nix/store` when present, a fresh `--tmpfs /tmp`,
+`/proc` and `/dev`, and a cleared environment.
+
+The control socket crosses the mount namespace because parenting
+binds its private directory read-write at the same path inside the
+jail, so the in-jail socket path equals the parent's. The parenting
+`.el` sources are bound read-only at their own path, so the child
+loads them and the parent can still verify they are readable.
+
+`:sandbox` keywords:
+
+- `:ro-binds` — extra read-only binds, a list whose elements are
+  either a path (bound at the same path inside) or a `(SRC . DEST)`
+  cons. This is also where project directories the child may read go;
+  there is no separate field for them.
+- `:rw-binds` — extra read-write binds, same shape.
+- `:environment` — a list of environment variable *names* to carry
+  into the otherwise-empty jail (via `--setenv`); everything else is
+  cleared. The baseline (`HOME` on the tmpfs, plus `PATH`, `TERM`,
+  `LANG` from `parenting-sandbox-default-environment`) is always set
+  first.
+- `:network` — non-nil to `--share-net`; nil (the default) leaves the
+  jail with no network.
+
+`parenting-sandbox-program`, `parenting-sandbox-system-directories`
+and `parenting-sandbox-default-environment` customize the bwrap
+binary, the system directories, and the baseline environment.
+
+To assemble the wrapper by hand instead — for a jail `:sandbox` does
+not cover, or a non-bwrap tool — the low-level keywords remain:
 
 ```elisp
 (parenting-spawn
@@ -327,8 +375,9 @@ a parent-resident agent has its tool calls routed into a child via
 `parenting-eval`. Either way the parent must assume the child is
 fully compromised. The layers, outermost first:
 
-1. OS-level isolation of the child process (`:command-wrapper`,
-   e.g. bwrap) bounds what the child can touch directly.
+1. OS-level isolation of the child process (`:sandbox`, or a
+   hand-built `:command-wrapper`, e.g. bwrap) bounds what the child
+   can touch directly.
 2. The parent structurally refuses `eval` requests — a child cannot
    evaluate forms in the parent at all.
 3. The allowlist defaults to deny-all; each grant can carry an

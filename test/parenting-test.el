@@ -668,5 +668,136 @@ exercises its remote routing."
           (should-not (process-live-p child)))
       (parenting-shutdown conn))))
 
+;;; Sandboxing children with bwrap
+
+(defun parenting-test--flag-values (args flag)
+  "Return the values that follow each FLAG occurrence in ARGS.
+Single-argument bwrap flags: collects the one word after each FLAG."
+  (let ((values nil)
+        (rest args))
+    (while rest
+      (when (equal (car rest) flag)
+        (push (cadr rest) values))
+      (setq rest (cdr rest)))
+    (nreverse values)))
+
+(defun parenting-test--bind-p (args flag src dest)
+  "Return non-nil if ARGS contains FLAG SRC DEST in sequence."
+  (let ((triple (list flag src dest))
+        (found nil)
+        (rest args))
+    (while (and rest (not found))
+      (when (equal (list (nth 0 rest) (nth 1 rest) (nth 2 rest)) triple)
+        (setq found t))
+      (setq rest (cdr rest)))
+    found))
+
+(ert-deftest parenting-sandbox-wrapper-core-flags ()
+  ;; The pure builder must always ask for the die-with-parent guard, a
+  ;; cleared environment, /proc, /dev and a private /tmp, and must bind
+  ;; the socket dir rw and the library dir ro at their own paths.
+  (let ((args (parenting--sandbox-command-wrapper
+               nil "/run/sock-dir" "/opt/parenting")))
+    (should (equal parenting-sandbox-program (car args)))
+    (should (member "--die-with-parent" args))
+    (should (member "--unshare-all" args))
+    (should (member "--clearenv" args))
+    (should (equal '("/proc") (parenting-test--flag-values args "--proc")))
+    (should (equal '("/dev") (parenting-test--flag-values args "--dev")))
+    (should (equal '("/tmp") (parenting-test--flag-values args "--tmpfs")))
+    ;; Socket directory bound read-write at the same path.
+    (should (parenting-test--bind-p
+             args "--bind" "/run/sock-dir" "/run/sock-dir"))
+    ;; Library directory bound read-only at the same path.
+    (should (parenting-test--bind-p
+             args "--ro-bind" "/opt/parenting" "/opt/parenting"))
+    ;; HOME is set (to a path under the socket directory).
+    (should (member "HOME" (parenting-test--flag-values args "--setenv")))))
+
+(ert-deftest parenting-sandbox-wrapper-network-toggle ()
+  ;; No network by default; --share-net only when the spec asks.
+  (should-not (member "--share-net"
+                      (parenting--sandbox-command-wrapper
+                       nil "/s" "/l")))
+  (should-not (member "--share-net"
+                      (parenting--sandbox-command-wrapper
+                       '(:network nil) "/s" "/l")))
+  (should (member "--share-net"
+                  (parenting--sandbox-command-wrapper
+                   '(:network t) "/s" "/l"))))
+
+(ert-deftest parenting-sandbox-wrapper-nix-store ()
+  ;; The whole store is bound read-only exactly when it exists.
+  (let ((args (parenting--sandbox-command-wrapper nil "/s" "/l")))
+    (should (eq (and (parenting-test--bind-p
+                      args "--ro-bind" "/nix/store" "/nix/store")
+                     t)
+                (and (file-exists-p "/nix/store") t)))))
+
+(ert-deftest parenting-sandbox-wrapper-environment-passthrough ()
+  ;; Each named, set variable is carried in with its own --setenv; an
+  ;; unset name is dropped rather than passed empty.
+  (let* ((set-name "PARENTING_TEST_PASS")
+         (unset-name "PARENTING_TEST_ABSENT_XYZZY"))
+    (setenv set-name "carried")
+    (setenv unset-name nil)
+    (unwind-protect
+        (let* ((args (parenting--sandbox-command-wrapper
+                      (list :environment (list set-name unset-name))
+                      "/s" "/l"))
+               (setenvs (parenting-test--flag-values args "--setenv")))
+          (should (member set-name setenvs))
+          (should-not (member unset-name setenvs))
+          ;; The value rides right after the name.
+          (let ((rest args) (value nil))
+            (while rest
+              (when (and (equal (car rest) "--setenv")
+                         (equal (cadr rest) set-name))
+                (setq value (nth 2 rest)))
+              (setq rest (cdr rest)))
+            (should (equal "carried" value))))
+      (setenv set-name nil))))
+
+(ert-deftest parenting-sandbox-wrapper-extra-binds ()
+  ;; Read-only and read-write extra binds, both plain paths and
+  ;; (src . dest) conses, land as the right bwrap flags.
+  (let ((args (parenting--sandbox-command-wrapper
+               '(:ro-binds ("/proj" ("/data/src" . "/data"))
+                 :rw-binds ("/scratch"))
+               "/s" "/l")))
+    (should (parenting-test--bind-p args "--ro-bind" "/proj" "/proj"))
+    (should (parenting-test--bind-p args "--ro-bind" "/data/src" "/data"))
+    (should (parenting-test--bind-p args "--bind" "/scratch" "/scratch"))))
+
+(ert-deftest parenting-spawn-sandbox-rejects-explicit-wrapper ()
+  ;; :sandbox owns :command-wrapper, :child-socket-path and
+  ;; :child-library-directory, so combining them is an error and no
+  ;; child is spawned.
+  (should-error (parenting-spawn :sandbox '(:network nil)
+                                 :command-wrapper '("bwrap")))
+  (should-error (parenting-spawn :sandbox '(:network nil)
+                                 :child-socket-path "/tmp/x"))
+  (should-error (parenting-spawn :sandbox '(:network nil)
+                                 :child-library-directory "/tmp/lib")))
+
+(defun parenting-test--bwrap-usable-p ()
+  "Return non-nil if bwrap can create an unprivileged user namespace.
+Many CI runners and nested sandboxes forbid this, so the live
+sandbox test skips rather than fails when it is unavailable."
+  (and (executable-find parenting-sandbox-program)
+       (eq 0 (call-process parenting-sandbox-program nil nil nil
+                           "--ro-bind" "/" "/" "true"))))
+
+(ert-deftest parenting-spawn-sandbox-child-roundtrips ()
+  ;; The end-to-end proof: a real child under bwrap, reached over a
+  ;; socket that crosses the mount namespace.  Skipped cleanly where
+  ;; unprivileged user namespaces are unavailable.
+  (unless (parenting-test--bwrap-usable-p)
+    (ert-skip "bwrap cannot create a user namespace here"))
+  (parenting-with-child (conn :sandbox '(:network nil) :timeout 60)
+    (should (equal 3 (parenting-eval conn '(+ 1 2))))
+    ;; The child really is jailed: no host network was shared.
+    (should (equal "sandboxed" (parenting-eval conn '"sandboxed")))))
+
 (provide 'parenting-test)
 ;;; parenting-test.el ends here

@@ -180,6 +180,113 @@ called with each new connection, which is also pushed onto
     (when (and directory (file-directory-p directory))
       (delete-directory directory t))))
 
+;;; Sandboxing children with bwrap
+
+(defcustom parenting-sandbox-program "bwrap"
+  "The bubblewrap executable used to build a `:sandbox' jail.
+`parenting-spawn' prefixes this to the child's command line, so a
+full path may be given when bwrap is not on `exec-path'."
+  :type 'string
+  :group 'parenting)
+
+(defcustom parenting-sandbox-system-directories
+  '("/usr" "/bin" "/lib" "/lib64" "/etc")
+  "System directories read-only bound into every `:sandbox' jail.
+These make a minimal root filesystem holding what the Emacs binary
+typically needs to run.  Only the ones that actually exist on the
+parent are bound, so a Nix-only host with no /usr simply skips it.
+The Nix store, when present, is bound separately."
+  :type '(repeat directory)
+  :group 'parenting)
+
+(defcustom parenting-sandbox-default-environment
+  '(("PATH" . "/usr/bin:/bin")
+    ("TERM" . "dumb")
+    ("LANG" . "C.UTF-8"))
+  "Environment set inside every `:sandbox' jail before pass-through.
+An alist of (NAME . VALUE).  The jail starts from an empty
+environment (bwrap --clearenv); these are set with --setenv, then
+HOME is pointed at the jail's tmpfs, and finally the caller's
+`:environment' pass-through names are copied in from this Emacs's
+environment.  Rebind or extend this to change the baseline."
+  :type '(alist :key-type string :value-type string)
+  :group 'parenting)
+
+(defun parenting--sandbox-bind-args (flag binds)
+  "Return bwrap arguments binding BINDS with FLAG.
+FLAG is a bwrap bind option such as \"--ro-bind\" or \"--bind\".
+Each element of BINDS is either a path (bound at the same path on
+both sides) or a cons (SRC . DEST)."
+  (cl-mapcan (lambda (bind)
+               (if (consp bind)
+                   (list flag (car bind) (cdr bind))
+                 (list flag bind bind)))
+             binds))
+
+(defun parenting--sandbox-command-wrapper (spec socket-directory
+                                                library-directory)
+  "Return the bwrap command prefix for SPEC, a `:sandbox' plist.
+SOCKET-DIRECTORY is the directory holding the control socket; it is
+bound read-write at the same path so the child can reach the socket
+across the mount namespace.  LIBRARY-DIRECTORY holds the parenting
+.el sources; it is bound read-only at the same path so the child can
+load them.
+
+SPEC keywords, all optional:
+  :ro-binds     extra read-only binds (paths or (SRC . DEST) conses),
+                the place for project directories the child may read;
+  :rw-binds     extra read-write binds, same shape;
+  :environment  a list of environment variable NAMES to carry into
+                the jail from this Emacs (everything else is cleared);
+  :network      non-nil to share the host network (default: no
+                network).
+
+The returned list is suitable as a `:command-wrapper' prefix: bwrap,
+a minimal read-only root, a private /tmp, /proc and /dev, the socket
+and library binds, a cleared environment seeded from
+`parenting-sandbox-default-environment' plus the pass-through names,
+and network sharing only when asked."
+  (let* ((home (expand-file-name "home" socket-directory))
+         (environment (plist-get spec :environment))
+         (ro-binds (plist-get spec :ro-binds))
+         (rw-binds (plist-get spec :rw-binds)))
+    (append
+     (list parenting-sandbox-program
+           "--die-with-parent"
+           "--unshare-all")
+     (and (plist-get spec :network) (list "--share-net"))
+     ;; A minimal root: the system directories that exist, plus the
+     ;; whole (world-readable) Nix store when there is one.
+     (parenting--sandbox-bind-args
+      "--ro-bind"
+      (cl-remove-if-not #'file-exists-p
+                        parenting-sandbox-system-directories))
+     (and (file-exists-p "/nix/store")
+          (list "--ro-bind" "/nix/store" "/nix/store"))
+     (list "--tmpfs" "/tmp"
+           "--proc" "/proc"
+           "--dev" "/dev")
+     ;; The control socket's directory, read-write, at the same path,
+     ;; so `child-socket-path' can equal the parent's socket path.
+     (list "--bind" socket-directory socket-directory)
+     ;; The parenting sources, read-only, at the same path, so the
+     ;; parent can verify readability and the child can load them.
+     (list "--ro-bind" library-directory library-directory)
+     ;; Extra caller binds.
+     (parenting--sandbox-bind-args "--ro-bind" ro-binds)
+     (parenting--sandbox-bind-args "--bind" rw-binds)
+     ;; A cleared environment: baseline, then a writable HOME on the
+     ;; tmpfs, then the caller's pass-through names.
+     (list "--clearenv")
+     (list "--setenv" "HOME" home)
+     (cl-mapcan (lambda (pair)
+                  (list "--setenv" (car pair) (cdr pair)))
+                parenting-sandbox-default-environment)
+     (cl-mapcan (lambda (var)
+                  (let ((value (getenv var)))
+                    (and value (list "--setenv" var value))))
+                environment))))
+
 ;;; Spawning children
 
 (defun parenting--child-library-directory ()
@@ -227,6 +334,7 @@ as the child sees it."
                                 socket-path
                                 child-socket-path
                                 child-library-directory
+                                sandbox
                                 (name "parenting-child")
                                 (timeout parenting-default-timeout))
   "Spawn a child Emacs and return a connection to it.
@@ -258,14 +366,35 @@ belongs to the caller and survives `parenting-shutdown'.
 CHILD-SOCKET-PATH is the same socket as seen from where the child
 runs (another mount namespace, or another machine entirely), when
 that differs.  CHILD-LIBRARY-DIRECTORY is where the child finds the
-parenting .el sources, when the parent's copy is not visible to it."
+parenting .el sources, when the parent's copy is not visible to it.
+
+SANDBOX, when non-nil, is a plist describing a bwrap jail; parenting
+turns it into the COMMAND-WRAPPER, CHILD-SOCKET-PATH and
+CHILD-LIBRARY-DIRECTORY for you, so it is mutually exclusive with
+those three (passing SANDBOX with any of them is an error).  The jail
+runs with --die-with-parent and no network by default, a minimal
+read-only root, a private /tmp, and a cleared environment.  The
+control socket's directory is bound read-write at its own path (so
+the child reaches the socket across the mount namespace) and the
+parenting sources read-only at their own path.  SANDBOX keywords:
+:ro-binds and :rw-binds are extra binds, each a list of paths or
+\(SRC . DEST) conses — put project directories the child may read on
+:ro-binds; :environment is a list of environment variable names to
+carry into the otherwise-empty jail; :network non-nil shares the
+host network.  See `parenting--sandbox-command-wrapper'."
   (when (and batch daemon)
     (error "Choose at most one of :batch and :daemon"))
+  (when (and sandbox (or command-wrapper child-socket-path
+                         child-library-directory))
+    (error "%s"
+           (concat ":sandbox sets :command-wrapper, :child-socket-path"
+                   " and :child-library-directory; do not pass them too")))
   (let* ((emacs (or emacs (expand-file-name invocation-name
                                             invocation-directory)))
          (directory (and (null socket-path)
                          (parenting--make-socket-directory)))
          (socket (or socket-path (expand-file-name "socket" directory)))
+         (socket-directory (or directory (file-name-directory socket)))
          (server (make-network-process
                   :name (concat name "-server")
                   :server t
@@ -276,6 +405,18 @@ parenting .el sources, when the parent's copy is not visible to it."
          (stderr (generate-new-buffer (format " *%s-stderr*" name)))
          (library-directory (or child-library-directory
                                 (parenting--child-library-directory)))
+         ;; :sandbox derives the wrapper from the private socket
+         ;; directory and the source directory, both bound at their
+         ;; own path inside the jail.  The socket dir being at the
+         ;; same path lets `child-socket-path' default to `socket',
+         ;; and the source dir being readable at the same path keeps
+         ;; the bootstrap `verified' check on (child-library-directory
+         ;; stays nil, so verified is t).
+         (command-wrapper
+          (if sandbox
+              (parenting--sandbox-command-wrapper
+               sandbox socket-directory library-directory)
+            command-wrapper))
          (child-command (append
                          (list emacs)
                          (and quick '("-Q"))
