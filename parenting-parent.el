@@ -205,10 +205,11 @@ The Nix store, when present, is bound separately."
     ("LANG" . "C.UTF-8"))
   "Environment set inside every `:sandbox' jail before pass-through.
 An alist of (NAME . VALUE).  The jail starts from an empty
-environment (bwrap --clearenv); these are set with --setenv, then
-HOME is pointed at the jail's tmpfs, and finally the caller's
-`:environment' pass-through names are copied in from this Emacs's
-environment.  Rebind or extend this to change the baseline."
+environment (bwrap --clearenv); HOME is set to a directory created
+per child under the read-write socket-directory bind, these are set
+with --setenv, and finally the caller's `:environment' pass-through
+names are copied in from this Emacs's environment.  Rebind or extend
+this to change the baseline."
   :type '(alist :key-type string :value-type string)
   :group 'parenting)
 
@@ -243,7 +244,9 @@ SPEC keywords, all optional:
 
 The returned list is suitable as a `:command-wrapper' prefix: bwrap,
 a minimal read-only root, a private /tmp, /proc and /dev, the socket
-and library binds, a cleared environment seeded from
+and library binds, a HOME directory created per child under the
+read-write socket-directory bind (removed with the socket directory
+at shutdown), a cleared environment seeded from
 `parenting-sandbox-default-environment' plus the pass-through names,
 and network sharing only when asked."
   (let* ((home (expand-file-name "home" socket-directory))
@@ -275,8 +278,16 @@ and network sharing only when asked."
      ;; Extra caller binds.
      (parenting--sandbox-bind-args "--ro-bind" ro-binds)
      (parenting--sandbox-bind-args "--bind" rw-binds)
-     ;; A cleared environment: baseline, then a writable HOME on the
-     ;; tmpfs, then the caller's pass-through names.
+     ;; HOME: a directory bwrap creates in the jail under the read-write
+     ;; socket-directory bind, so it exists and is writable before the
+     ;; child starts (a daemon child writes savehist, recentf, its eln
+     ;; cache and `user-emacs-directory' there).  One per child; it is
+     ;; removed with the socket directory at shutdown.  This must come
+     ;; after the socket-directory bind so the mount exists when the
+     ;; directory is created inside it.
+     (list "--dir" home)
+     ;; A cleared environment: baseline, then HOME, then the caller's
+     ;; pass-through names.
      (list "--clearenv")
      (list "--setenv" "HOME" home)
      (cl-mapcan (lambda (pair)

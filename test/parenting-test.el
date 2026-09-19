@@ -736,7 +736,23 @@ Single-argument bwrap flags: collects the one word after each FLAG."
     (should (parenting-test--bind-p
              args "--ro-bind" "/opt/parenting" "/opt/parenting"))
     ;; HOME is set (to a path under the socket directory).
-    (should (member "HOME" (parenting-test--flag-values args "--setenv")))))
+    (should (member "HOME" (parenting-test--flag-values args "--setenv")))
+    ;; That HOME directory is created in the jail with --dir, inside
+    ;; the socket-directory bind: after the bind (so the mount exists
+    ;; when the directory is made) and before HOME is set to it.
+    (let* ((home (expand-file-name "home" "/run/sock-dir"))
+           (bind-pos (cl-position "/run/sock-dir" args :test #'equal))
+           (dir-pos (cl-position "--dir" args :test #'equal))
+           (setenv-home-pos (cl-loop for i from 0
+                                     for (flag name) on args
+                                     when (and (equal flag "--setenv")
+                                               (equal name "HOME"))
+                                     return i)))
+      (should (equal (list home) (parenting-test--flag-values args "--dir")))
+      (should bind-pos)
+      (should dir-pos)
+      (should setenv-home-pos)
+      (should (< bind-pos dir-pos setenv-home-pos)))))
 
 (ert-deftest parenting-sandbox-wrapper-network-toggle ()
   ;; No network by default; --share-net only when the spec asks.
@@ -821,7 +837,12 @@ sandbox test skips rather than fails when it is unavailable."
   (parenting-with-child (conn :sandbox '(:network nil) :timeout 60)
     (should (equal 3 (parenting-eval conn '(+ 1 2))))
     ;; The child really is jailed: no host network was shared.
-    (should (equal "sandboxed" (parenting-eval conn '"sandboxed")))))
+    (should (equal "sandboxed" (parenting-eval conn '"sandboxed")))
+    ;; HOME exists in the jail as a writable directory (created by
+    ;; --dir under the socket-directory bind), so a daemon child can
+    ;; write savehist, recentf and its eln cache there.
+    (should (parenting-eval conn '(file-directory-p (getenv "HOME"))))
+    (should (parenting-eval conn '(file-writable-p (getenv "HOME"))))))
 
 (provide 'parenting-test)
 ;;; parenting-test.el ends here
