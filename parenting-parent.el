@@ -180,7 +180,34 @@ called with each new connection, which is also pushed onto
     (when (and directory (file-directory-p directory))
       (delete-directory directory t))))
 
-;;; Sandboxing children with bwrap
+;;; Sandboxing children
+
+;; A `:sandbox' spec (paths, environment, network) says what the child
+;; may reach; a backend turns it into the command prefix that enforces
+;; it.  The spec is the same for every backend.  Backends differ in one
+;; way worth knowing: bwrap builds a mount namespace holding only the
+;; granted paths, so everything else is absent, while Landlock and
+;; Seatbelt leave the host filesystem in place and refuse access, so
+;; an ungranted path can still be probed for existence (`stat',
+;; `access') but not read, listed or written.
+
+(defcustom parenting-sandbox-backend
+  (if (eq system-type 'darwin) 'sandbox-exec 'bwrap)
+  "How `parenting-spawn' builds a `:sandbox' jail.
+`bwrap' (the default on GNU/Linux): bubblewrap, a mount namespace
+holding only the granted paths.  Needs unprivileged user namespaces.
+`landlock': Landlock through the landrun launcher
+\(`parenting-sandbox-landlock-program').  No namespaces, so it works
+where user namespaces are disabled; needs Landlock ABI 4 or later for
+the network restriction.
+`sandbox-exec' (the default on macOS): a Seatbelt profile run with
+`parenting-sandbox-exec-program'.
+A function is also accepted: it is called with the spec, the socket
+directory and the library directory, as the built-in backends are,
+and returns the command prefix."
+  :type '(choice (const bwrap) (const landlock) (const sandbox-exec)
+                 function)
+  :group 'parenting)
 
 (defcustom parenting-sandbox-program "bwrap"
   "The bubblewrap executable used to build a `:sandbox' jail.
@@ -226,6 +253,40 @@ both sides) or a cons (SRC . DEST)."
 
 (defun parenting--sandbox-command-wrapper (spec socket-directory
                                                 library-directory)
+  "Return the command prefix enforcing SPEC, a `:sandbox' plist.
+Dispatches on `parenting-sandbox-backend'; SOCKET-DIRECTORY and
+LIBRARY-DIRECTORY are as for `parenting--sandbox-bwrap'."
+  (let ((backend parenting-sandbox-backend))
+    (funcall (pcase backend
+               ('bwrap #'parenting--sandbox-bwrap)
+               ('landlock #'parenting--sandbox-landlock)
+               ('sandbox-exec #'parenting--sandbox-seatbelt)
+               ((pred functionp) backend)
+               (_ (error "Unknown `parenting-sandbox-backend': %S" backend)))
+             spec socket-directory library-directory)))
+
+(defun parenting--sandbox-same-path-binds (binds keyword)
+  "Return BINDS, signaling if any is a (SRC . DEST) cons.
+KEYWORD names the spec field for the error.  Only bwrap can mount a
+path at a different location; the other backends grant paths where
+they are."
+  (dolist (bind binds binds)
+    (when (consp bind)
+      (error "%s: the %S backend grants paths in place; %S needs bwrap"
+             keyword parenting-sandbox-backend bind))))
+
+(defun parenting--sandbox-environment (spec home)
+  "Return the jail environment for SPEC as an alist of (NAME . VALUE).
+HOME first, then `parenting-sandbox-default-environment', then each
+`:environment' name that is set in this Emacs, in that order."
+  (append (list (cons "HOME" home))
+          parenting-sandbox-default-environment
+          (delq nil (mapcar (lambda (var)
+                              (let ((value (getenv var)))
+                                (and value (cons var value))))
+                            (plist-get spec :environment)))))
+
+(defun parenting--sandbox-bwrap (spec socket-directory library-directory)
   "Return the bwrap command prefix for SPEC, a `:sandbox' plist.
 SOCKET-DIRECTORY is the directory holding the control socket; it is
 bound read-write at the same path so the child can reach the socket
@@ -297,6 +358,170 @@ and network sharing only when asked."
                   (let ((value (getenv var)))
                     (and value (list "--setenv" var value))))
                 environment))))
+
+(defcustom parenting-sandbox-landlock-program "landrun"
+  "The landrun executable used by the `landlock' sandbox backend.
+landrun applies Landlock rules to the process it runs and then execs
+it; see https://github.com/Zouuup/landrun."
+  :type 'string
+  :group 'parenting)
+
+(defcustom parenting-sandbox-device-files
+  '(("/dev/null" . rw) ("/dev/zero" . ro) ("/dev/urandom" . ro)
+    ("/dev/random" . ro) ("/dev/tty" . rw))
+  "Device files granted by the Landlock and Seatbelt backends.
+An alist of (PATH . ACCESS) with ACCESS `ro' or `rw'; files that do
+not exist on the parent are skipped.  bwrap gets its own /dev."
+  :type '(alist :key-type file :value-type (choice (const ro) (const rw)))
+  :group 'parenting)
+
+(defun parenting--sandbox-landlock (spec socket-directory library-directory)
+  "Return the landrun command prefix for SPEC, a `:sandbox' plist.
+SOCKET-DIRECTORY and LIBRARY-DIRECTORY are as for
+`parenting--sandbox-bwrap', granted read-write and read-only at
+their own paths.  Landlock grants paths where they are, so the spec's
+binds must be plain paths.  The child gets read and execute access to
+the system directories that exist and the Nix store, the device files
+in `parenting-sandbox-device-files', a HOME and a TMPDIR under the
+socket directory (created by `parenting-spawn'), the environment of
+`parenting--sandbox-environment' and nothing else, and no TCP unless
+the spec's :network is non-nil.  /proc is not granted.  Landlock
+restricts TCP only; UDP and other socket families stay open."
+  (let* ((home (expand-file-name "home" socket-directory))
+         (tmp (expand-file-name "tmp" socket-directory))
+         (ro-binds (parenting--sandbox-same-path-binds
+                    (plist-get spec :ro-binds) :ro-binds))
+         (rw-binds (parenting--sandbox-same-path-binds
+                    (plist-get spec :rw-binds) :rw-binds))
+         (flags (lambda (flag paths)
+                  (cl-mapcan (lambda (path) (list flag path)) paths))))
+    (append
+     (list parenting-sandbox-landlock-program)
+     (and (plist-get spec :network) (list "--unrestricted-network"))
+     (funcall flags "--rox"
+              (append (cl-remove-if-not
+                       #'file-exists-p parenting-sandbox-system-directories)
+                      (and (file-exists-p "/nix/store") '("/nix/store"))))
+     (funcall flags "--ro" (list library-directory))
+     (funcall flags "--rw" (list socket-directory))
+     (cl-mapcan (lambda (device)
+                  (and (file-exists-p (car device))
+                       (list (if (eq (cdr device) 'rw) "--rw" "--ro")
+                             (car device))))
+                parenting-sandbox-device-files)
+     (funcall flags "--ro" ro-binds)
+     (funcall flags "--rw" rw-binds)
+     (cl-mapcan (lambda (pair)
+                  (list "--env" (concat (car pair) "=" (cdr pair))))
+                (append (parenting--sandbox-environment spec home)
+                        (list (cons "TMPDIR" tmp))))
+     (list "--"))))
+
+(defcustom parenting-sandbox-exec-program "sandbox-exec"
+  "The sandbox-exec executable used by the `sandbox-exec' backend."
+  :type 'string
+  :group 'parenting)
+
+(defcustom parenting-sandbox-exec-system-directories
+  '("/usr" "/bin" "/System" "/Library" "/private/etc"
+    "/private/var/db/timezone" "/opt/homebrew" "/Applications")
+  "Directories the `sandbox-exec' backend lets the child read.
+The macOS counterpart of `parenting-sandbox-system-directories';
+the ones that exist on the parent are granted, plus the Nix store."
+  :type '(repeat directory)
+  :group 'parenting)
+
+(defcustom parenting-sandbox-exec-extra-rules nil
+  "Extra Seatbelt rules appended to the `sandbox-exec' profile.
+A list of strings, each one complete rule such as
+\"(allow mach-lookup (global-name \\\"com.apple.foo\\\"))\"."
+  :type '(repeat string)
+  :group 'parenting)
+
+(defun parenting--seatbelt-string (string)
+  "Return STRING as a quoted Seatbelt profile string literal."
+  (concat "\""
+          (replace-regexp-in-string "[\"\\]" "\\\\\\&" string)
+          "\""))
+
+(defun parenting--sandbox-seatbelt-profile (spec socket-directory
+                                                 library-directory)
+  "Return the Seatbelt profile text enforcing SPEC.
+Deny by default; allow process creation within the sandbox, reading
+metadata everywhere (so path lookups work; see the note on visibility
+above), reading the macOS system directories, the Nix store,
+LIBRARY-DIRECTORY and the spec's :ro-binds, reading and writing
+SOCKET-DIRECTORY, the device files and the spec's :rw-binds, and the
+network only when the spec's :network is non-nil (the control socket,
+a Unix socket under SOCKET-DIRECTORY, is always reachable)."
+  (let* ((ro-binds (parenting--sandbox-same-path-binds
+                    (plist-get spec :ro-binds) :ro-binds))
+         (rw-binds (parenting--sandbox-same-path-binds
+                    (plist-get spec :rw-binds) :rw-binds))
+         (subpaths (lambda (paths)
+                     (mapconcat (lambda (path)
+                                  (format " (subpath %s)"
+                                          (parenting--seatbelt-string
+                                           (directory-file-name path))))
+                                paths "")))
+         (devices (lambda (access)
+                    (mapconcat (lambda (device)
+                                 (if (and (eq (cdr device) access)
+                                          (file-exists-p (car device)))
+                                     (format " (literal %s)"
+                                             (parenting--seatbelt-string
+                                              (car device)))
+                                   ""))
+                               parenting-sandbox-device-files ""))))
+    (mapconcat
+     #'identity
+     (append
+      (list "(version 1)"
+            "(deny default)"
+            "(allow process-fork)"
+            "(allow process-exec)"
+            "(allow signal (target same-sandbox))"
+            "(allow sysctl-read)"
+            "(allow file-read-metadata)"
+            (format "(allow file-read*%s%s%s)"
+                    (funcall subpaths
+                             (append
+                              (cl-remove-if-not
+                               #'file-exists-p
+                               parenting-sandbox-exec-system-directories)
+                              (and (file-exists-p "/nix/store")
+                                   '("/nix/store"))
+                              (list library-directory)
+                              ro-binds))
+                    (funcall devices 'ro)
+                    (funcall devices 'rw))
+            (format "(allow file-read* file-write*%s%s)"
+                    (funcall subpaths (cons socket-directory rw-binds))
+                    (funcall devices 'rw)))
+      (if (plist-get spec :network)
+          (list "(allow network*)")
+        (list (format "(allow network-outbound (remote unix-socket%s))"
+                      (funcall subpaths (list socket-directory)))))
+      parenting-sandbox-exec-extra-rules)
+     "\n")))
+
+(defun parenting--sandbox-seatbelt (spec socket-directory library-directory)
+  "Return the sandbox-exec command prefix for SPEC, a `:sandbox' plist.
+The profile is `parenting--sandbox-seatbelt-profile'; the environment
+is cleared with env -i and set as for the Landlock backend, with HOME
+and TMPDIR under SOCKET-DIRECTORY.  LIBRARY-DIRECTORY is readable at
+its own path.  This backend is covered by tests of the generated
+command only; it has not yet been run on macOS."
+  (let ((home (expand-file-name "home" socket-directory))
+        (tmp (expand-file-name "tmp" socket-directory)))
+    (append
+     (list parenting-sandbox-exec-program
+           "-p" (parenting--sandbox-seatbelt-profile
+                 spec socket-directory library-directory)
+           "/usr/bin/env" "-i")
+     (mapcar (lambda (pair) (concat (car pair) "=" (cdr pair)))
+             (append (parenting--sandbox-environment spec home)
+                     (list (cons "TMPDIR" tmp)))))))
 
 ;;; Spawning children
 
@@ -382,20 +607,21 @@ runs (another mount namespace, or another machine entirely), when
 that differs.  CHILD-LIBRARY-DIRECTORY is where the child finds the
 parenting .el sources, when the parent's copy is not visible to it.
 
-SANDBOX, when non-nil, is a plist describing a bwrap jail; parenting
-turns it into the COMMAND-WRAPPER, CHILD-SOCKET-PATH and
-CHILD-LIBRARY-DIRECTORY for you, so it is mutually exclusive with
-those three (passing SANDBOX with any of them is an error).  The jail
-runs with --die-with-parent and no network by default, a minimal
-read-only root, a private /tmp, and a cleared environment.  The
-control socket's directory is bound read-write at its own path (so
-the child reaches the socket across the mount namespace) and the
-parenting sources read-only at their own path.  SANDBOX keywords:
-:ro-binds and :rw-binds are extra binds, each a list of paths or
-\(SRC . DEST) conses — put project directories the child may read on
-:ro-binds; :environment is a list of environment variable names to
-carry into the otherwise-empty jail; :network non-nil shares the
-host network.  See `parenting--sandbox-command-wrapper'."
+SANDBOX, when non-nil, is a plist describing a jail, which the backend
+in `parenting-sandbox-backend' (bwrap, Landlock or macOS Seatbelt)
+enforces; parenting turns it into the COMMAND-WRAPPER,
+CHILD-SOCKET-PATH and CHILD-LIBRARY-DIRECTORY for you, so it is
+mutually exclusive with those three (passing SANDBOX with any of them
+is an error).  The jail has no network by default, a minimal
+read-only view of the system, a private HOME and TMPDIR, and a
+cleared environment.  The control socket's directory is read-write at
+its own path and the parenting sources read-only at their own path.
+SANDBOX keywords: :ro-binds and :rw-binds are extra paths, each a
+list of paths, or with bwrap also (SRC . DEST) conses; put project
+directories the child may read on :ro-binds.  :environment is a list
+of environment variable names to carry into the otherwise-empty jail;
+:network non-nil allows the network.  See
+`parenting--sandbox-command-wrapper'."
   (when (and batch daemon)
     (error "Choose at most one of :batch and :daemon"))
   (when (and sandbox (or command-wrapper child-socket-path
@@ -428,8 +654,17 @@ host network.  See `parenting--sandbox-command-wrapper'."
          ;; stays nil, so verified is t).
          (command-wrapper
           (if sandbox
-              (parenting--sandbox-command-wrapper
-               sandbox socket-directory library-directory)
+              (progn
+                ;; HOME and TMPDIR for the jail, on the host side of the
+                ;; read-write socket-directory grant: the Landlock and
+                ;; Seatbelt backends have no mount namespace to create
+                ;; them in, and the --dir of the bwrap backend finds
+                ;; them already there.  Both go with the socket
+                ;; directory at shutdown.
+                (dolist (sub '("home" "tmp"))
+                  (make-directory (expand-file-name sub socket-directory) t))
+                (parenting--sandbox-command-wrapper
+                 sandbox socket-directory library-directory))
             command-wrapper))
          (child-command (append
                          (list emacs)

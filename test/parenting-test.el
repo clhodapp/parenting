@@ -844,5 +844,136 @@ sandbox test skips rather than fails when it is unavailable."
     (should (parenting-eval conn '(file-directory-p (getenv "HOME"))))
     (should (parenting-eval conn '(file-writable-p (getenv "HOME"))))))
 
+;;; Sandbox backends
+
+(ert-deftest parenting-sandbox-backend-dispatch ()
+  ;; A function backend receives the spec and both directories and its
+  ;; return value is the prefix; an unknown symbol is an error.
+  (let ((parenting-sandbox-backend
+         (lambda (spec socket-directory library-directory)
+           (list "custom" (format "%S" spec) socket-directory
+                 library-directory))))
+    (should (equal '("custom" "(:network t)" "/s" "/l")
+                   (parenting--sandbox-command-wrapper
+                    '(:network t) "/s" "/l"))))
+  (let ((parenting-sandbox-backend 'no-such-backend))
+    (should-error (parenting--sandbox-command-wrapper nil "/s" "/l"))))
+
+(ert-deftest parenting-sandbox-landlock-wrapper ()
+  ;; landrun first and "--" last; the socket directory read-write, the
+  ;; library read-only, the store read-and-execute when present; HOME
+  ;; and TMPDIR under the socket directory; TCP only when asked.
+  (let* ((parenting-sandbox-backend 'landlock)
+         (args (parenting--sandbox-command-wrapper
+                '(:ro-binds ("/proj") :rw-binds ("/scratch"))
+                "/run/sock-dir" "/opt/parenting"))
+         (envs (parenting-test--flag-values args "--env")))
+    (should (equal parenting-sandbox-landlock-program (car args)))
+    (should (equal "--" (car (last args))))
+    (should (member "/run/sock-dir" (parenting-test--flag-values args "--rw")))
+    (should (member "/scratch" (parenting-test--flag-values args "--rw")))
+    (should (member "/opt/parenting" (parenting-test--flag-values args "--ro")))
+    (should (member "/proj" (parenting-test--flag-values args "--ro")))
+    (should (eq (and (member "/nix/store"
+                             (parenting-test--flag-values args "--rox"))
+                     t)
+                (and (file-exists-p "/nix/store") t)))
+    (should (member "HOME=/run/sock-dir/home" envs))
+    (should (member "TMPDIR=/run/sock-dir/tmp" envs))
+    (should-not (member "--unrestricted-network" args))
+    (should (member "--unrestricted-network"
+                    (parenting--sandbox-command-wrapper
+                     '(:network t) "/s" "/l")))
+    ;; Landlock grants paths in place: a remapping bind is an error.
+    (should-error (parenting--sandbox-command-wrapper
+                   '(:ro-binds (("/src" . "/dest"))) "/s" "/l"))))
+
+(ert-deftest parenting-sandbox-landlock-environment ()
+  ;; Only the named, set variables are carried in, after the baseline.
+  (let ((parenting-sandbox-backend 'landlock))
+    (setenv "PARENTING_TEST_PASS" "carried")
+    (setenv "PARENTING_TEST_ABSENT_XYZZY" nil)
+    (unwind-protect
+        (let ((envs (parenting-test--flag-values
+                     (parenting--sandbox-command-wrapper
+                      '(:environment ("PARENTING_TEST_PASS"
+                                      "PARENTING_TEST_ABSENT_XYZZY"))
+                      "/s" "/l")
+                     "--env")))
+          (should (member "PARENTING_TEST_PASS=carried" envs))
+          (should-not (cl-find-if (lambda (e)
+                                    (string-prefix-p
+                                     "PARENTING_TEST_ABSENT_XYZZY" e))
+                                  envs)))
+      (setenv "PARENTING_TEST_PASS" nil))))
+
+(ert-deftest parenting-sandbox-seatbelt-wrapper ()
+  ;; sandbox-exec with a deny-by-default profile, then env -i with the
+  ;; jail environment; the network only when asked, the control socket
+  ;; always.
+  (let* ((parenting-sandbox-backend 'sandbox-exec)
+         (args (parenting--sandbox-command-wrapper
+                '(:ro-binds ("/proj") :rw-binds ("/scratch"))
+                "/run/sock-dir" "/opt/parenting"))
+         (profile (nth 2 args)))
+    (should (equal (list parenting-sandbox-exec-program "-p")
+                   (cl-subseq args 0 2)))
+    (should (equal '("/usr/bin/env" "-i") (cl-subseq args 3 5)))
+    (should (member "HOME=/run/sock-dir/home" args))
+    (should (member "TMPDIR=/run/sock-dir/tmp" args))
+    (should (string-match-p "^(deny default)$" profile))
+    (should (string-match-p
+             "^(allow file-read\\* file-write\\* (subpath \"/run/sock-dir\") (subpath \"/scratch\")"
+             profile))
+    (should (string-match-p "(subpath \"/opt/parenting\")" profile))
+    (should (string-match-p "(subpath \"/proj\")" profile))
+    (should (string-match-p
+             "^(allow network-outbound (remote unix-socket (subpath \"/run/sock-dir\")))$"
+             profile))
+    (should-not (string-match-p "(allow network\\*)" profile))
+    (should (string-match-p "^(allow network\\*)$"
+                            (nth 2 (parenting--sandbox-command-wrapper
+                                    '(:network t) "/s" "/l"))))))
+
+(ert-deftest parenting-sandbox-seatbelt-quoting ()
+  ;; Quotes and backslashes in a path cannot end the string literal.
+  (should (equal "\"/a\\\"b\\\\c\""
+                 (parenting--seatbelt-string "/a\"b\\c"))))
+
+(defun parenting-test--landrun-usable-p ()
+  "Return non-nil if landrun can apply a Landlock ruleset here.
+Kernels without Landlock, or without the network restriction the
+backend asks for, make it fail; the live test then skips."
+  (and (executable-find parenting-sandbox-landlock-program)
+       (eq 0 (call-process parenting-sandbox-landlock-program nil nil nil
+                           "--rox" "/" "--" "true"))))
+
+(ert-deftest parenting-spawn-landlock-child-roundtrips ()
+  ;; A real child under Landlock: it answers over the socket, has a
+  ;; writable HOME, sees no variable it was not given, and cannot read
+  ;; a file outside its grants that this Emacs can.
+  (unless (parenting-test--landrun-usable-p)
+    (ert-skip "landrun cannot apply Landlock here"))
+  (let ((parenting-sandbox-backend 'landlock)
+        (secret (make-temp-file "parenting-landlock-secret")))
+    (unwind-protect
+        (progn
+          (with-temp-file secret (insert "secret"))
+          (setenv "PARENTING_TEST_NOT_PASSED" "leak")
+          (parenting-with-child (conn :sandbox '(:network nil) :timeout 60)
+            (should (equal 3 (parenting-eval conn '(+ 1 2))))
+            (should (parenting-eval conn '(file-writable-p (getenv "HOME"))))
+            (should-not (parenting-eval
+                         conn '(getenv "PARENTING_TEST_NOT_PASSED")))
+            (should (eq 'refused
+                        (parenting-eval
+                         conn `(condition-case nil
+                                   (with-temp-buffer
+                                     (insert-file-contents ,secret)
+                                     'read)
+                                 (file-error 'refused)))))))
+      (setenv "PARENTING_TEST_NOT_PASSED" nil)
+      (delete-file secret))))
+
 (provide 'parenting-test)
 ;;; parenting-test.el ends here
