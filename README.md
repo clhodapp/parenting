@@ -134,8 +134,27 @@ Testing a fresh nix build is just:
 ```
 
 For children that must run inside a sandbox (e.g. an Emacs-hosted
-LLM agent), `:sandbox` builds a [bubblewrap](https://github.com/containers/bubblewrap)
-jail for you:
+LLM agent), `:sandbox` builds a jail for you. The spec says what the
+child may reach; `parenting-sandbox-backend` picks what enforces it:
+
+- `bwrap` (the default on GNU/Linux):
+  [bubblewrap](https://github.com/containers/bubblewrap), a mount
+  namespace holding only the granted paths, so everything else is
+  absent. Needs unprivileged user namespaces.
+- `landlock`: [Landlock](https://docs.kernel.org/userspace-api/landlock.html)
+  through the [landrun](https://github.com/Zouuup/landrun) launcher
+  (`parenting-sandbox-landlock-program`). No namespaces, so it works
+  where user namespaces are disabled. The host filesystem stays in
+  place: an ungranted path can still be probed for existence (`stat`,
+  `access`) but not read, listed or written. Landlock restricts TCP,
+  not UDP.
+- `sandbox-exec` (the default on macOS): a deny-by-default Seatbelt
+  profile run with `sandbox-exec`, with the same visibility as
+  Landlock. This backend is tested as generated text only and has not
+  yet been run on macOS; `parenting-sandbox-exec-extra-rules` adds
+  rules a child turns out to need.
+- a function, called with the spec, the socket directory and the
+  library directory, returning the command prefix.
 
 ```elisp
 (parenting-spawn
@@ -144,6 +163,11 @@ jail for you:
             :environment ("SSL_CERT_FILE")   ; names carried in
             :network nil))                   ; no network (the default)
 ```
+
+The rest of this section describes the bwrap backend; the others take
+the same spec, grant paths in place (so a `(SRC . DEST)` remapping is
+bwrap only), and give the child a HOME and a TMPDIR under the socket
+directory instead of a private `/tmp`.
 
 `:sandbox` is a plist and, when given, derives `:command-wrapper`,
 `:child-socket-path` and `:child-library-directory` itself, so those
